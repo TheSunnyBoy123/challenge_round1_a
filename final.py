@@ -36,7 +36,7 @@ def convert_pdfs_to_images(pdf_dir: str, output_dir: str):
                 print(f"    [Error] Could not convert {filename}: {e}")
 
 # ==============================================================================
-#  PART 1: DOCUMENT PROCESSING CLASS (FINAL HIERARCHY ENGINE)
+#  PART 1: DOCUMENT PROCESSING CLASS (CORE LOGIC UNCHANGED)
 # ==============================================================================
 class DocumentProcessor:
     def __init__(self, input_dir: str, model_path: str, output_dir: str):
@@ -51,7 +51,6 @@ class DocumentProcessor:
         self.docseg_model = None
         os.makedirs(self.output_dir, exist_ok=True)
 
-    # --- Helper methods (_load_and_sort_images, _load_model, etc.) are unchanged ---
     def _load_and_sort_images(self):
         if not os.path.isdir(self.input_dir): return False
         image_files = sorted([f for f in os.listdir(self.input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
@@ -116,83 +115,54 @@ class DocumentProcessor:
 
     def _assign_hierarchy_hybrid(self, components: list) -> list:
         print("  - Final Engine: Using Hybrid Rule-Based Classification...")
-        
         headers = [c for c in components if c.get('type') == 'Section-header']
-        if not headers:
-            return components
-
-        # --- Pass 1: Rule-based assignment for numbered headings ---
-        rule_assigned_indices = set()
+        if not headers: return components
+        rule_assigned_indices, unassigned_headers = set(), []
         for i, header in enumerate(headers):
-            text = header.get('text', '').strip()
-            match = re.match(r'^(\d+(\.\d+)*)\.?', text)
+            match = re.match(r'^(\d+(\.\d+)*)\.?', header.get('text', '').strip())
             if match:
                 level = match.group(1).count('.') + 1
                 if level <= 4:
                     header['hierarchy_level'] = f'h{level}'
                     rule_assigned_indices.add(i)
-
-        # --- Prepare for Classification/Clustering Pass ---
+        
         unassigned_headers = [h for i, h in enumerate(headers) if i not in rule_assigned_indices]
         if not unassigned_headers:
             print("    - All headers assigned by numbering rules.")
             return components
 
-        # --- Create Style Profiles from Ruled Headers ---
-        style_centroids = {}
-        assigned_by_rule = [h for i, h in enumerate(headers) if i in rule_assigned_indices]
-        
         features_to_use = ['font_size', 'norm_x0', 'is_centered']
+        assigned_by_rule = [h for i, h in enumerate(headers) if i in rule_assigned_indices]
         if assigned_by_rule:
             print("    - Creating style profiles from numbered headings...")
-            # Scale features for all headers at once for consistent distance metrics
             all_header_features = np.array([[h[key] for key in features_to_use] for h in headers])
             scaler = StandardScaler()
             scaled_all_features = scaler.fit_transform(all_header_features)
-
-            # Map original header index to its position in the scaled array
             header_map = {id(h): i for i, h in enumerate(headers)}
-
-            # Group scaled features by hierarchy level
             grouped_features = defaultdict(list)
             for header in assigned_by_rule:
-                level = header['hierarchy_level']
-                scaled_feature_vector = scaled_all_features[header_map[id(header)]]
-                grouped_features[level].append(scaled_feature_vector)
+                grouped_features[header['hierarchy_level']].append(scaled_all_features[header_map[id(header)]])
             
-            for level, feature_list in grouped_features.items():
-                style_centroids[level] = np.mean(feature_list, axis=0)
-
-            # --- Pass 2: Classify remaining headers by style similarity ---
+            style_centroids = {level: np.mean(feature_list, axis=0) for level, feature_list in grouped_features.items()}
             print(f"    - Classifying {len(unassigned_headers)} un-numbered headers...")
             for header in unassigned_headers:
-                if not style_centroids: break # Should not happen if we entered this block
+                if not style_centroids: break
                 scaled_feature_vector = scaled_all_features[header_map[id(header)]]
-                # Find closest style centroid
                 distances = {level: np.linalg.norm(scaled_feature_vector - centroid) for level, centroid in style_centroids.items()}
-                closest_level = min(distances, key=distances.get)
-                header['hierarchy_level'] = closest_level
+                header['hierarchy_level'] = min(distances, key=distances.get)
         else:
-            # --- Fallback: No numbered headers found, cluster the unassigned ---
             print("    - No numbered headings found. Falling back to style clustering.")
-            if len(unassigned_headers) < 2: return components # Cannot cluster one item
-
+            if len(unassigned_headers) < 2: return components
             feature_matrix = np.array([[h[key] for key in features_to_use] for h in unassigned_headers])
-            scaler = StandardScaler()
-            scaled_features = scaler.fit_transform(feature_matrix)
-
+            scaled_features = StandardScaler().fit_transform(feature_matrix)
             n_clusters = min(4, len(unassigned_headers))
-            agg_cluster = AgglomerativeClustering(n_clusters=n_clusters, linkage='ward')
-            labels = agg_cluster.fit_predict(scaled_features)
-
+            labels = AgglomerativeClustering(n_clusters=n_clusters, linkage='ward').fit_predict(scaled_features)
             font_size_index = features_to_use.index('font_size')
             cluster_avg_font_size = [feature_matrix[labels == i, font_size_index].mean() for i in range(n_clusters)]
             sorted_cluster_indices = sorted(range(n_clusters), key=lambda i: cluster_avg_font_size[i], reverse=True)
-            
             hierarchy_map = {cluster_id: f'h{rank + 1}' for rank, cluster_id in enumerate(sorted_cluster_indices)}
             for i, component in enumerate(unassigned_headers):
                 component['hierarchy_level'] = hierarchy_map[labels[i]]
-
         return components
 
     def process_document(self):
@@ -201,24 +171,24 @@ class DocumentProcessor:
         if not self._load_and_sort_images() or not self._load_model(): return False
         results = self._run_yolo_model()
         if not results: return False
-        
         document_components = self._extract_components_with_ocr(results)
         document_components.sort(key=lambda c: (c['page'], c['bbox'][1], c['bbox'][0]))
         document_components = self._identify_main_title(document_components)
         document_components = self._extract_hierarchical_features(document_components)
         document_components = self._assign_hierarchy_hybrid(document_components)
-        
         for i, component in enumerate(document_components): component['line_id'] = i + 1
-
         print(f"  - Saving layout analysis to: '{self.output_json_path}'")
         with open(self.output_json_path, 'w', encoding='utf-8') as f:
             json.dump(document_components, f, indent=4, ensure_ascii=False)
         return True
 
 # ==============================================================================
-#  PART 2 & 3: ORCHESTRATORS (UNCHANGED)
+#  PART 2: ORCHESTRATORS (REFINED)
 # ==============================================================================
-def run_full_pipeline(base_image_dir, main_output_dir, model_path):
+def run_full_pipeline(base_image_dir, intermediate_layout_dir, model_path):
+    """
+    Processes all document image folders, saving intermediate layout files.
+    """
     if not os.path.exists(model_path):
         print(f"FATAL ERROR: Model file not found at '{model_path}'")
         return
@@ -228,12 +198,16 @@ def run_full_pipeline(base_image_dir, main_output_dir, model_path):
     doc_names = [d for d in os.listdir(base_image_dir) if os.path.isdir(os.path.join(base_image_dir, d))]
     for doc_name in doc_names:
         input_image_dir = os.path.join(base_image_dir, doc_name)
-        doc_output_dir = os.path.join(main_output_dir, doc_name)
-        processor = DocumentProcessor(input_dir=input_image_dir, model_path=model_path, output_dir=doc_output_dir)
+        # Each document gets its own subdirectory for intermediate files
+        doc_layout_dir = os.path.join(intermediate_layout_dir, doc_name)
+        processor = DocumentProcessor(input_dir=input_image_dir, model_path=model_path, output_dir=doc_layout_dir)
         if not processor.process_document():
             print(f"  [Error] Document processing failed for {doc_name}.")
 
 def format_to_final_outline(layout_data: list) -> dict:
+    """
+    Formats the detailed layout data into the final, clean outline structure.
+    """
     title_text = ""
     outline = []
     layout_data.sort(key=lambda x: x.get('line_id', float('inf')))
@@ -241,85 +215,78 @@ def format_to_final_outline(layout_data: list) -> dict:
         if component.get('type') == 'Title' and not title_text:
             title_text = component.get('text', '').strip()
         if 'hierarchy_level' in component:
-            outline.append({"level": component['hierarchy_level'].upper(), "text": component.get('text', '').strip(), "page": component.get('page')})
+            outline.append({
+                "level": component['hierarchy_level'].upper(), 
+                "text": component.get('text', '').strip(), 
+                "page": component.get('page')
+            })
     return {"title": title_text, "outline": outline}
 
-def run_conversion_to_outline(main_output_dir: str):
-    if not os.path.exists(main_output_dir):
-        print(f"  [Error] Main output directory '{main_output_dir}' not found.")
+def run_final_conversion(intermediate_dir: str, final_dir: str):
+    """
+    UPDATED: Reads intermediate layouts and saves the final JSON outline to the
+    top-level final output directory with the correct name.
+    """
+    if not os.path.exists(intermediate_dir):
+        print(f"  [Error] Intermediate directory '{intermediate_dir}' not found.")
         return
-    doc_names = [d for d in os.listdir(main_output_dir) if os.path.isdir(os.path.join(main_output_dir, d))]
+    doc_names = [d for d in os.listdir(intermediate_dir) if os.path.isdir(os.path.join(intermediate_dir, d))]
     for doc_name in doc_names:
-        layout_json_path = os.path.join(main_output_dir, doc_name, 'document_layout.json')
-        final_outline_path = os.path.join(main_output_dir, doc_name, 'final_outline.json')
+        layout_json_path = os.path.join(intermediate_dir, doc_name, 'document_layout.json')
+        # The final output is named after the document and placed in the root of the final directory
+        final_outline_path = os.path.join(final_dir, f"{doc_name}.json")
         if os.path.exists(layout_json_path):
-            print(f"  - Converting '{doc_name}'...")
+            print(f"  - Creating final output for '{doc_name}'...")
             try:
                 with open(layout_json_path, 'r', encoding='utf-8') as f: layout_data = json.load(f)
                 final_data = format_to_final_outline(layout_data)
                 with open(final_outline_path, 'w', encoding='utf-8') as f: json.dump(final_data, f, indent=4, ensure_ascii=False)
                 print(f"    - Successfully saved final outline to '{final_outline_path}'")
             except Exception as e:
-                print(f"    [Error] Could not convert {doc_name}: {e}")
+                print(f"    [Error] Could not create final output for {doc_name}: {e}")
 
 # ==============================================================================
-#  MAIN EXECUTION BLOCK (UNCHANGED)
+#  MAIN EXECUTION BLOCK (REFINED FOR CLARITY AND ROBUSTNESS)
 # ==============================================================================
 if __name__ == "__main__":
+    # --- Define fixed paths for the environment ---
     PDF_INPUT_DIR = '/app/input'
     FINAL_OUTPUT_DIR = '/app/output'
-    MODEL_PATH = 'yolov8x-doclaynet-epoch64-imgsz640-finallr1e-5.pt' # Ensure this is in your container
+    MODEL_PATH = '/app/yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt'
 
-    # Use a temporary directory inside the container for intermediate files
-    TEMP_IMAGE_DIR = '/tmp/processed_images' 
-    
+    # --- Define temporary directories for all intermediate files ---
+    TEMP_BASE_DIR = '/tmp/doc_processing'
+    TEMP_IMAGE_DIR = os.path.join(TEMP_BASE_DIR, 'images')
+    TEMP_LAYOUT_DIR = os.path.join(TEMP_BASE_DIR, 'layouts')
+
+    # --- Setup directories ---
     os.makedirs(FINAL_OUTPUT_DIR, exist_ok=True)
     os.makedirs(TEMP_IMAGE_DIR, exist_ok=True)
-    
-    print("--- Docker container started ---")
+    os.makedirs(TEMP_LAYOUT_DIR, exist_ok=True)
+
+    print("--- Document Outline Extraction Pipeline Started ---")
     
     if not os.path.exists(MODEL_PATH):
         print(f"FATAL ERROR: Model file not found at '{MODEL_PATH}'")
         exit()
 
-    pdf_files = [f for f in os.listdir(PDF_INPUT_DIR) if f.lower().endswith('.pdf')]
-    if not pdf_files:
-        print("No PDF files found in /app/input. Exiting.")
-        exit()
+    # --- STEP 1: Convert all PDFs to images into a temporary location ---
+    print("\n--- STEP 1: Converting PDFs to Images ---")
+    convert_pdfs_to_images(pdf_dir=PDF_INPUT_DIR, output_dir=TEMP_IMAGE_DIR)
 
-    for pdf_filename in pdf_files:
-        pdf_name_without_ext = os.path.splitext(pdf_filename)[0]
-        pdf_path = os.path.join(PDF_INPUT_DIR, pdf_filename)
-        
-        # Define paths for this specific PDF
-        image_subdir = os.path.join(TEMP_IMAGE_DIR, pdf_name_without_ext)
-        final_json_output_path = os.path.join(FINAL_OUTPUT_DIR, f"{pdf_name_without_ext}.json")
+    # --- STEP 2: Run layout analysis and save intermediate files to a temporary location ---
+    print("\n--- STEP 2: Running Document Layout Analysis ---")
+    run_full_pipeline(
+        base_image_dir=TEMP_IMAGE_DIR, 
+        intermediate_layout_dir=TEMP_LAYOUT_DIR,
+        model_path=MODEL_PATH
+    )
 
-        print(f"\n--- Processing {pdf_filename} ---")
-        
-        # 1. Convert PDF to Images
-        try:
-            os.makedirs(image_subdir, exist_ok=True)
-            images = convert_from_path(pdf_path, dpi=300)
-            for i, image in enumerate(images):
-                image_path = os.path.join(image_subdir, f'page_{i+1:03d}.jpg')
-                image.save(image_path, 'JPEG')
-            print(f"  - Converted {len(images)} pages.")
-        except Exception as e:
-            print(f"  [Error] Could not convert {pdf_filename}: {e}")
-            continue
+    # --- STEP 3: Generate the final, clean JSON outputs in the required directory ---
+    print("\n--- STEP 3: Generating Final Output JSONs ---")
+    run_final_conversion(
+        intermediate_dir=TEMP_LAYOUT_DIR,
+        final_dir=FINAL_OUTPUT_DIR
+    )
 
-        processor = DocumentProcessor(input_dir=image_subdir, model_path=MODEL_PATH, output_dir=FINAL_OUTPUT_DIR)
-        
-        if not processor.process_document():
-            print(f"  [Error] Document processing failed for {pdf_filename}.")
-            continue
-        
-        layout_data = processor.document_components
-        final_data = format_to_final_outline(layout_data)
-        
-        with open(final_json_output_path, 'w', encoding='utf-8') as f:
-            json.dump(final_data, f, indent=4, ensure_ascii=False)
-        print(f"  - Successfully created final output at '{final_json_output_path}'")
-        
-    print("\n--- All PDFs processed. ---")
+    print("\n--- All PDFs processed successfully. ---")
