@@ -1,0 +1,9 @@
+ultralytics
+pytesseract
+opencv-python-headless
+numpy
+Pillow
+pdf2image
+scikit-learn
+scipy
+dill
